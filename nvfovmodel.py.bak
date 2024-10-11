@@ -1,0 +1,403 @@
+from contextlib import contextmanager, nullcontext
+
+import numpy as np 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+# from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+
+from pytorch3d.renderer.cameras import (
+    FoVPerspectiveCameras,
+    FoVOrthographicCameras,
+    look_at_view_transform,
+)
+from pytorch3d.renderer.camera_utils import join_cameras_as_batch
+
+from monai.losses import PerceptualLoss
+from monai.networks.nets import UNet, VNet, SwinUNETR
+from monai.networks.layers.factories import Norm
+from monai.utils import optional_import
+from monai.metrics import PSNRMetric, SSIMMetric
+tqdm, has_tqdm = optional_import("tqdm", name="tqdm")
+
+from generative.inferers import DiffusionInferer
+from generative.networks.nets import DiffusionModelUNet
+from generative.networks.schedulers import DDPMScheduler, DDIMScheduler
+
+from typing import Any, Callable, Dict, Optional, OrderedDict, Tuple, List
+from lightning.pytorch import LightningModule
+from omegaconf import DictConfig, OmegaConf
+
+from dvr.renderer import ObjectCentricXRayVolumeRenderer
+
+def make_cameras_dea(
+    dist: torch.Tensor,
+    elev: torch.Tensor,
+    azim: torch.Tensor,
+    fov: int = 40,
+    znear: int = 4.0,
+    zfar: int = 8.0,
+    is_orthogonal: bool = False,
+):
+    assert dist.device == elev.device == azim.device
+    _device = dist.device
+    R, T = look_at_view_transform(dist=dist, elev=elev * 90, azim=azim * 180)
+    if is_orthogonal:
+        return FoVOrthographicCameras(R=R, T=T, znear=znear, zfar=zfar).to(_device)
+    return FoVPerspectiveCameras(R=R, T=T, fov=fov, znear=znear, zfar=zfar).to(_device)
+
+
+
+def init_weights(net, init_type='normal', init_gain=0.02):
+    """Initialize network weights.
+    Parameters:
+        net (network)   -- network to be initialized
+        init_type (str) -- the name of an initialization method: normal | xavier | kaiming | orthogonal
+        init_gain (float)    -- scaling factor for normal, xavier and orthogonal.
+    We use 'normal' in the original pix2pix and CycleGAN paper. But xavier and kaiming might
+    work better for some applications. Feel free to try yourself.
+    """
+    def init_func(m):  # define the initialization function
+        classname = m.__class__.__name__
+        if hasattr(m, 'weight') and (classname.find('Conv') != -1 or classname.find('Linear') != -1):
+            if init_type == 'normal':
+                nn.init.normal_(m.weight.data, 0.0, init_gain)
+            elif init_type == 'xavier':
+                nn.init.xavier_normal_(m.weight.data, gain=init_gain)
+            elif init_type == 'kaiming':
+                nn.init.kaiming_normal_(m.weight.data, a=0, mode='fan_in')
+            elif init_type == 'orthogonal':
+                nn.init.orthogonal_(m.weight.data, gain=init_gain)
+            else:
+                raise NotImplementedError('initialization method [%s] is not implemented' % init_type)
+            if hasattr(m, 'bias') and m.bias is not None:
+                nn.init.constant_(m.bias.data, 0.0)
+        elif classname.find('BatchNorm') != -1:  # BatchNorm Layer's weight is not a matrix; only normal distribution applies.
+            nn.init.normal_(m.weight.data, 1.0, init_gain)
+            nn.init.constant_(m.bias.data, 0.0)
+    # print('initialize network with %s' % init_type)
+    net.apply(init_func)  # apply the initialization function <init_func>
+
+
+class FoVLightningModule(LightningModule):
+    def __init__(self, model_cfg: DictConfig, train_cfg: DictConfig):
+        super().__init__()
+
+        self.model_cfg = model_cfg
+        self.train_cfg = train_cfg
+        
+        self.lookup_table = nn.Embedding(
+            num_embeddings=4096, 
+            embedding_dim=1
+        )
+        # self.lookup_table.weight.data.uniform_(0, 256).long()
+        self.lookup_table.weight.data.zero_().long()
+
+        self.fwd_renderer = ObjectCentricXRayVolumeRenderer(
+            image_width=model_cfg.img_shape,
+            image_height=model_cfg.img_shape,
+            n_pts_per_ray=model_cfg.n_pts_per_ray,
+            min_depth=model_cfg.min_depth,
+            max_depth=model_cfg.max_depth,
+            ndc_extent=model_cfg.ndc_extent,
+        )
+
+        self.unet2d_model = DiffusionModelUNet(
+            spatial_dims=2,
+            in_channels=1,
+            out_channels=model_cfg.fov_depth,
+            num_channels=[256, 256, 512],
+            attention_levels=[False, False, True],
+            num_head_channels=[0, 0, 512],
+            num_res_blocks=2,
+            # with_conditioning=True, 
+            # cross_attention_dim=12, # Condition with straight/hidden view  # flatR | flatT
+            upcast_attention=True,
+            use_flash_attention=True,
+            dropout_cattn=0.5
+        )
+        
+        init_weights(self.unet2d_model, init_type="normal", init_gain=0.02)
+        
+        self.p20loss = PerceptualLoss(
+            spatial_dims=2, 
+            network_type="radimagenet_resnet50", 
+            is_fake_3d=False, 
+            pretrained=True,
+        ) 
+        
+        self.p25loss = PerceptualLoss(
+            spatial_dims=3, 
+            network_type="radimagenet_resnet50", 
+            is_fake_3d=True, fake_3d_ratio=0.0625,
+            pretrained=True,
+        ) 
+
+        self.p30loss = PerceptualLoss(
+            spatial_dims=3, 
+            network_type="medicalnet_resnet50_23datasets", 
+            is_fake_3d=False, 
+            pretrained=True,
+        ) 
+
+        if model_cfg.phase=="finetune":
+            pass
+        
+        if self.train_cfg.ckpt:
+            print("Loading.. ", self.train_cfg.ckpt)
+            checkpoint = torch.load(self.train_cfg.ckpt, map_location=torch.device("cpu"))["state_dict"]
+            state_dict = {k: v for k, v in checkpoint.items() if k in self.state_dict()}
+            self.load_state_dict(state_dict, strict=False)
+            # self.load_from_checkpoint(self.train_cfg.ckpt)
+
+        self.save_hyperparameters()
+        self.train_step_outputs = []
+        self.validation_step_outputs = []
+
+        self.psnr = PSNRMetric(max_val=1.0)
+        self.ssim = SSIMMetric(spatial_dims=3, data_range=1.0)
+        self.psnr_outputs = []
+        self.ssim_outputs = []
+
+    # def correct_window(self, T_old, 
+    #     a_min=-1024, 
+    #     a_max=3071, 
+    #     b_min=-600, 
+    #     b_max=800, 
+    #     factor=1.0    
+    # ):
+    #     # Calculate the range for the old and new scales
+    #     range_old = a_max - a_min
+    #     range_new = b_max - b_min
+
+    #     # Reverse the incorrect scaling
+    #     T_raw = (T_old * range_old) + a_min
+
+    #     # Apply the correct scaling
+    #     T_new = (T_raw - b_min) / range_new 
+    #     return T_new 
+    
+    def forward_screen(self, image3d, cameras, is_training=False):
+        # image3d = self.correct_window(image3d, a_min=-1024, a_max=3071, b_min=-600, b_max=800)
+        colored = self.LTable(torch.flatten(torch.Tensor(grayscale)).long())
+        image2d = self.fwd_renderer(image3d, cameras)
+        return image2d
+    
+    def flatten_cameras(self, cameras, zero_translation=False):
+        camera_ = cameras.clone()
+        R = camera_.R
+        if zero_translation:
+            T = torch.zeros_like(camera_.T.unsqueeze_(-1))
+        else:
+            T = camera_.T.unsqueeze_(-1)
+        return torch.cat([R.reshape(-1, 1, 9), T.reshape(-1, 1, 3)], dim=-1).contiguous().view(-1, 1, 12)
+
+    def forward_volume(self, image2d, cameras):
+        _device = image2d.device
+        B = image2d.shape[0]
+        timesteps = 0*torch.randint(0, 1000, (B,), device=_device).long()  
+        image2d = torch.flip(image2d, dims=(-1,))
+        out = self.unet2d_model.forward(image2d, timesteps=timesteps)
+
+        # Resample the frustum out
+        z = torch.linspace(-1.0, 1.0, steps=self.model_cfg.vol_shape, device=_device)
+        y = torch.linspace(-1.0, 1.0, steps=self.model_cfg.vol_shape, device=_device)
+        x = torch.linspace(-1.0, 1.0, steps=self.model_cfg.vol_shape, device=_device)
+        grd = torch.stack(torch.meshgrid(x, y, z), dim=-1).view(-1, 3).unsqueeze(0).repeat(image2d.shape[0], 1, 1)  # 1 DHW 3 to B DHW 3
+        
+        # Process (resample) the volumes from ray views to ndc
+        pts = cameras.transform_points_ndc(grd)  # world to ndc, 1 DHW 3
+        res = F.grid_sample(
+            out.float().unsqueeze(1), 
+            pts.view(-1, self.model_cfg.vol_shape, self.model_cfg.vol_shape, self.model_cfg.vol_shape, 3).float(), 
+            mode="bilinear", 
+            padding_mode="zeros", 
+            align_corners=True,
+        )
+        # res = torch.permute(res, [0, 1, 4, 2, 3])
+        res = torch.permute(res, [0, 1, 4, 3, 2])
+        res = torch.flip(res, dims=(-2,))
+        return res
+        # vol = self.unet3d_model.forward(res, timesteps=timesteps)
+        # # return torch.cat([res, vol], dim=1)
+        # return vol #0.5*(vol + res)
+    
+    def _common_step(self, batch, batch_idx, stage: Optional[str] = "evaluation"):
+        image2d = batch["image2d"]
+        image3d = batch["image3d"]
+        _device = batch["image3d"].device
+        B = image2d.shape[0]
+
+        # Construct the random cameras, -1 and 1 are the same point in azimuths
+        dist_random = 8 * torch.ones(B, device=_device)
+        elev_random = torch.zeros(B, device=_device)
+        azim_random = torch.rand_like(dist_random) * 2 - 1  # from [0 1) to [-1 1)
+        view_random = make_cameras_dea(dist_random, elev_random, azim_random, fov=self.model_cfg.fov, znear=self.model_cfg.min_depth, zfar=self.model_cfg.max_depth)
+    
+        dist_hidden = 8 * torch.ones(B, device=_device)
+        elev_hidden = torch.zeros(B, device=_device)
+        azim_hidden = torch.zeros(B, device=_device)
+        view_hidden = make_cameras_dea(dist_hidden, elev_hidden, azim_hidden, fov=self.model_cfg.fov, znear=self.model_cfg.min_depth, zfar=self.model_cfg.max_depth)
+
+        # Construct the samples in 2D
+        figure_xr_source_hidden = image2d
+        figure_ct_source_hidden = self.forward_screen(image3d=image3d, cameras=view_hidden)
+        figure_ct_source_random = self.forward_screen(image3d=image3d, cameras=view_random)
+            
+        # Run the forward pass
+        figure_dx_source_concat = torch.cat([figure_xr_source_hidden, figure_ct_source_hidden, figure_ct_source_random])
+        camera_dx_render_concat = join_cameras_as_batch([view_hidden, view_hidden, view_random])
+
+        # For 3D
+        volume_dx_reproj_concat = self.forward_volume(
+            image2d=figure_dx_source_concat, 
+            cameras=camera_dx_render_concat, 
+        )
+        volume_xr_reproj_hidden, \
+        volume_ct_reproj_hidden, \
+        volume_ct_reproj_random = torch.split(volume_dx_reproj_concat, B, dim=0)
+           
+        figure_xr_reproj_hidden_hidden = self.forward_screen(image3d=volume_xr_reproj_hidden[:,[0],...], cameras=view_hidden)
+        figure_xr_reproj_hidden_random = self.forward_screen(image3d=volume_xr_reproj_hidden[:,[0],...], cameras=view_random)
+        
+        figure_ct_reproj_hidden_hidden = self.forward_screen(image3d=volume_ct_reproj_hidden[:,[0],...], cameras=view_hidden)
+        figure_ct_reproj_hidden_random = self.forward_screen(image3d=volume_ct_reproj_hidden[:,[0],...], cameras=view_random)
+        
+        figure_ct_reproj_random_hidden = self.forward_screen(image3d=volume_ct_reproj_random[:,[0],...], cameras=view_hidden)
+        figure_ct_reproj_random_random = self.forward_screen(image3d=volume_ct_reproj_random[:,[0],...], cameras=view_random)
+        
+        im3d_loss_inv = F.l1_loss(volume_ct_reproj_hidden, image3d) \
+                      + F.l1_loss(volume_ct_reproj_random, image3d) \
+        
+        im2d_loss_inv = F.l1_loss(figure_ct_reproj_hidden_hidden, figure_ct_source_hidden) \
+                      + F.l1_loss(figure_ct_reproj_hidden_random, figure_ct_source_random) \
+                      + F.l1_loss(figure_ct_reproj_random_hidden, figure_ct_source_hidden) \
+                      + F.l1_loss(figure_ct_reproj_random_random, figure_ct_source_random) \
+                    #   + F.l1_loss(figure_xr_reproj_hidden_hidden, figure_xr_source_hidden) \
+        
+        pc3d_loss_all = self.p30loss(volume_ct_reproj_hidden[:,[0],...], image3d) \
+                      + self.p30loss(volume_ct_reproj_random[:,[0],...], image3d) \
+                      + self.p25loss(volume_ct_reproj_hidden[:,[0],...], image3d) \
+                      + self.p25loss(volume_ct_reproj_random[:,[0],...], image3d) \
+                      + self.p30loss(volume_xr_reproj_hidden[:,[0],...], image3d) \
+                      + self.p25loss(volume_xr_reproj_hidden[:,[0],...], image3d) \
+                      
+        pc3d_loss_all = torch.nan_to_num(pc3d_loss_all, nan=1.0) 
+        pc2d_loss_all = self.p20loss(figure_ct_reproj_hidden_hidden, figure_ct_source_hidden) \
+                      + self.p20loss(figure_ct_reproj_hidden_random, figure_ct_source_random) \
+                      + self.p20loss(figure_ct_reproj_random_hidden, figure_ct_source_hidden) \
+                      + self.p20loss(figure_ct_reproj_random_random, figure_ct_source_random) \
+                      + self.p20loss(figure_xr_reproj_hidden_hidden, image2d) \
+                      + self.p20loss(figure_xr_reproj_hidden_random, figure_ct_source_random) \
+                      
+        pc2d_loss_all = torch.nan_to_num(pc2d_loss_all, nan=1.0) 
+        
+        loss = self.train_cfg.alpha * im2d_loss_inv + self.train_cfg.gamma * im3d_loss_inv \
+             + self.train_cfg.lamda * pc2d_loss_all + self.train_cfg.lamda * pc3d_loss_all  
+ 
+        self.log(f"{stage}_loss", loss, on_step=(stage == "train"), prog_bar=True, logger=True, sync_dist=True, batch_size=B)
+        
+        # Visualization step
+        if batch_idx == 0:
+            # Sampling step for X-ray
+            with torch.no_grad():
+                zeros = torch.zeros_like(image2d)
+                
+                viz2d = torch.cat([
+                    torch.cat([
+                        figure_xr_source_hidden, 
+                        figure_ct_source_hidden, 
+                        figure_ct_source_random, 
+                        figure_xr_reproj_hidden_random,
+                        image3d[:, [0], :, self.model_cfg.vol_shape // 2, :], 
+                        image3d[:, [0], :, self.model_cfg.vol_shape // 2, :], 
+                    ], dim=-1),
+                    torch.cat([
+                        figure_xr_reproj_hidden_hidden, 
+                        figure_ct_reproj_hidden_hidden, 
+                        figure_ct_reproj_hidden_random, 
+                        volume_xr_reproj_hidden[:, [0], :, self.model_cfg.vol_shape // 2, :], 
+                        volume_ct_reproj_hidden[:, [0], :, self.model_cfg.vol_shape // 2, :], 
+                        volume_ct_reproj_random[:, [0], :, self.model_cfg.vol_shape // 2, :], 
+                    ], dim=-1)
+                ], dim=-2)
+
+                tensorboard = self.logger.experiment
+                grid2d = torchvision.utils.make_grid(viz2d, normalize=False, scale_each=False, nrow=1, padding=0).clamp(0, 1)
+                tensorboard.add_image(f"{stage}_df_samples", grid2d, self.current_epoch * B + batch_idx)    
+        return loss
+                        
+    def training_step(self, batch, batch_idx):
+        loss = self._common_step(batch, batch_idx, stage="train")
+        self.train_step_outputs.append(loss)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        loss = self._common_step(batch, batch_idx, stage="validation")
+        self.validation_step_outputs.append(loss)
+        return loss
+
+    def test_step(self, batch, batch_idx):
+        image2d = batch["image2d"]
+        image3d = batch["image3d"]
+        _device = batch["image3d"].device
+        B = image2d.shape[0]
+
+        # Construct the random cameras, -1 and 1 are the same point in azimuths
+        dist_hidden = 8 * torch.ones(B, device=_device)
+        elev_hidden = torch.zeros(B, device=_device)
+        azim_hidden = torch.zeros(B, device=_device)
+        view_hidden = make_cameras_dea(dist_hidden, elev_hidden, azim_hidden, fov=self.model_cfg.fov, znear=self.model_cfg.min_depth, zfar=self.model_cfg.max_depth)
+
+        # Construct the samples in 2D
+        figure_xr_source_hidden = image2d
+        figure_ct_source_hidden = self.forward_screen(image3d=image3d, cameras=view_hidden)
+
+        # Reconstruct the Encoder-Decoder
+        volume_ct_reproj_hidden = self.forward_volume(image2d=figure_ct_source_hidden, cameras=view_hidden)
+        psnr = self.psnr(volume_ct_reproj_hidden, image3d)
+        ssim = self.ssim(volume_ct_reproj_hidden, image3d)
+        self.psnr_outputs.append(psnr)
+        self.ssim_outputs.append(ssim)
+    
+    def on_train_epoch_end(self):
+        loss = torch.stack(self.train_step_outputs).mean()
+        self.log(
+            f"train_loss_epoch",
+            loss,
+            on_step=False,
+            prog_bar=True,
+            logger=True,
+            sync_dist=True,
+        )
+        self.train_step_outputs.clear()  # free memory
+
+    def on_validation_epoch_end(self):
+        loss = torch.stack(self.validation_step_outputs).mean()
+        self.log(
+            f"validation_loss_epoch",
+            loss,
+            on_step=False,
+            prog_bar=True,
+            logger=True,
+            sync_dist=True,
+        )
+        self.validation_step_outputs.clear()  # free memory
+
+    def on_test_epoch_end(self):
+        print(f"PSNR :{torch.stack(self.psnr_outputs).mean()}")
+        print(f"SSIM :{torch.stack(self.ssim_outputs).mean()}")
+        self.psnr_outputs.clear()
+        self.ssim_outputs.clear()
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
+            self.parameters(), lr=self.train_cfg.lr, betas=(0.5, 0.999)
+        )
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer, #
+            milestones=[100, 200, 300, 400], 
+            gamma=0.5
+        )
+        return [optimizer], [scheduler]
