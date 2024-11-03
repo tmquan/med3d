@@ -75,16 +75,13 @@ test: null
 #   ckpt: ${resume_from_checkpoint}
 #   strict: 1 if ${resume_from_checkpoint} is not None else 0
 
-resume_from_checkpoint: unet3d_pretrain.ckpt # 
-# resume_from_checkpoint: unet3d.ckpt # 
-# resume_from_checkpoint: epoch=299-step=300000.ckpt # 
-# resume_from_checkpoint: epoch=319-step=320000.ckpt # 
-
+# resume_from_checkpoint: null
+resume_from_checkpoint: logs/diffusion/version_0/checkpoints/epoch=119-step=120000.ckpt
 
 trainer:
   accelerator: auto
   devices: -1
-  precision: 32
+  precision: '16-mixed'
   strategy: "ddp_find_unused_parameters_true"
   max_epochs: ${train.epochs}
   enable_model_summary: true

@@ -76,11 +76,6 @@ test: null
 #   strict: 1 if ${resume_from_checkpoint} is not None else 0
 
 resume_from_checkpoint: null
-# resume_from_checkpoint: unet3d_pretrain.ckpt # 
-# resume_from_checkpoint: init.ckpt # 
-# resume_from_checkpoint: epoch=299-step=300000.ckpt # 
-# resume_from_checkpoint: epoch=319-step=320000.ckpt # 
-
 
 trainer:
   accelerator: auto

@@ -29,6 +29,7 @@ from monai.transforms import (
     RandZoomDict,
     ZoomDict,
     RandRotateDict,
+    RandGaussianNoiseDict,
     HistogramNormalizeDict,
     ScaleIntensityDict,
     ScaleIntensityRangeDict,
@@ -210,12 +211,19 @@ class UnpairedDataModule(LightningDataModule):
                 RandZoomDict(
                     keys=["image3d"],
                     prob=1.0,
-                    min_zoom=0.95,
+                    min_zoom=0.65,
                     max_zoom=1.15,
                     padding_mode="constant",
                     mode=["trilinear"],
                     align_corners=True,
                 ),
+                # RandGaussianNoiseDict(
+                #     keys=["image3d"],
+                #     prob=1.0, 
+                #     mean=0.0, 
+                #     std=0.05, 
+                #     sample_std=False
+                # ),
                 RandZoomDict(
                     keys=["image2d"],
                     prob=1.0,

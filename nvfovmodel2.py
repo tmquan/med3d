@@ -161,25 +161,10 @@ class FoVLightningModule(LightningModule):
             num_res_blocks=2,
             upcast_attention=True,
             use_flash_attention=True,
-            # dropout_cattn=0.5
+            dropout_cattn=0.5
             # with_conditioning=True, 
             # cross_attention_dim=12, # Condition with straight/hidden view  # flatR | flatT
         )
-
-        # self.unet2d_model = UNet(
-        #     spatial_dims=2,
-        #     in_channels=1,
-        #     out_channels=model_cfg.fov_depth, 
-        #     channels=(64, 128, 256, 512, 1024), #encoder_feature_channel["efficientnet-b8"], 
-        #     strides=(2, 2, 2, 2), #(2, 2, 2, 2, 2),
-        #     num_res_units=2,
-        #     kernel_size=3,
-        #     up_kernel_size=3,
-        #     act=("LeakyReLU", {"inplace": True}),
-        #     dropout=0.5,
-        #     # norm=Norm.BATCH,
-        #     # mode="pixelshuffle",
-        # )
 
         # self.unet3d_model = DiffusionModelUNet(
         #     spatial_dims=3,
@@ -232,7 +217,6 @@ class FoVLightningModule(LightningModule):
         #     # dropout=0.5
         # )
 
-        # self.unet3d_model = None
         self.unet3d_model = UNet(
             spatial_dims=3,
             in_channels=1,
@@ -243,8 +227,8 @@ class FoVLightningModule(LightningModule):
             kernel_size=3,
             up_kernel_size=3,
             act=("LeakyReLU", {"inplace": True}),
-            # dropout=0.5,
-            # norm=Norm.BATCH,
+            dropout=0.5,
+            norm=Norm.BATCH,
             # mode="pixelshuffle",
         )
 
@@ -299,30 +283,31 @@ class FoVLightningModule(LightningModule):
         #     in_channels=1,
         #     out_channels=1,
         # )
-        
-        # init_weights(self.unet2d_model, init_type="normal", init_gain=0.02)
-        # init_weights(self.unet3d_model, init_type="normal", init_gain=0.02)
-        
-        # self.p20loss = PerceptualLoss(
-        #     spatial_dims=2, 
-        #     network_type="radimagenet_resnet50", 
-        #     is_fake_3d=False, 
-        #     pretrained=True,
-        # ) 
-        
-        # self.p25loss = PerceptualLoss(
-        #     spatial_dims=3, 
-        #     network_type="radimagenet_resnet50", 
-        #     is_fake_3d=True, fake_3d_ratio=16/256.,
-        #     pretrained=True,
-        # ) 
 
-        # self.p30loss = PerceptualLoss(
-        #     spatial_dims=3, 
-        #     network_type="medicalnet_resnet50_23datasets", 
-        #     is_fake_3d=False, 
-        #     pretrained=True,
-        # ) 
+        
+        init_weights(self.unet2d_model, init_type="normal", init_gain=0.02)
+        init_weights(self.unet3d_model, init_type="normal", init_gain=0.02)
+        
+        self.p20loss = PerceptualLoss(
+            spatial_dims=2, 
+            network_type="radimagenet_resnet50", 
+            is_fake_3d=False, 
+            pretrained=True,
+        ) 
+        
+        self.p25loss = PerceptualLoss(
+            spatial_dims=3, 
+            network_type="radimagenet_resnet50", 
+            is_fake_3d=True, fake_3d_ratio=16/256.,
+            pretrained=True,
+        ) 
+
+        self.p30loss = PerceptualLoss(
+            spatial_dims=3, 
+            network_type="medicalnet_resnet50_23datasets", 
+            is_fake_3d=False, 
+            pretrained=True,
+        ) 
 
         if model_cfg.phase=="finetune":
             pass
@@ -430,8 +415,7 @@ class FoVLightningModule(LightningModule):
                     return out
             else:
                 return out
-            return out
-            # return torch.cat([out, res], dim=1)
+            # return out
         else:
             return res
     
@@ -452,8 +436,8 @@ class FoVLightningModule(LightningModule):
         azim_hidden = torch.zeros(B, device=_device)
         view_hidden = make_cameras_dea(dist_hidden, elev_hidden, azim_hidden, fov=self.model_cfg.fov, znear=self.model_cfg.min_depth, zfar=self.model_cfg.max_depth)
 
-        noise_std_0 = torch.normal(mean=torch.zeros_like(image3d), std=0.05) if stage=='train' else torch.zeros_like(image3d)
-        noise_std_1 = torch.normal(mean=torch.zeros_like(image3d), std=0.05) if stage=='train' else torch.zeros_like(image3d)
+        noise_std_0 = torch.normal(mean=torch.zeros_like(image3d), std=0.01) if stage=='train' else torch.zeros_like(image3d)
+        noise_std_1 = torch.normal(mean=torch.zeros_like(image3d), std=0.01) if stage=='train' else torch.zeros_like(image3d)
 
         # Construct the samples in 2D
         figure_xr_source_hidden = image2d
@@ -483,33 +467,41 @@ class FoVLightningModule(LightningModule):
         figure_ct_reproj_random_hidden = self.forward_screen(image3d=volume_ct_reproj_random[:,[0],...], cameras=view_hidden, learnable_windowing=False)
         figure_ct_reproj_random_random = self.forward_screen(image3d=volume_ct_reproj_random[:,[0],...], cameras=view_random, learnable_windowing=False)
         
-        im3d_loss_inv = F.l1_loss(volume_ct_reproj_hidden, (image3d+noise_std_1)) \
-                      + F.l1_loss(volume_ct_reproj_random, (image3d+noise_std_1)) \
+        im3d_loss_inv = F.l1_loss(volume_ct_reproj_hidden, image3d+noise_std_1) \
+                      + F.l1_loss(volume_ct_reproj_random, image3d+noise_std_1) \
         
         im2d_loss_inv = F.l1_loss(figure_ct_reproj_hidden_hidden, figure_ct_source_hidden) \
                       + F.l1_loss(figure_ct_reproj_hidden_random, figure_ct_source_random) \
                       + F.l1_loss(figure_ct_reproj_random_hidden, figure_ct_source_hidden) \
-                      + F.l1_loss(figure_ct_reproj_random_random, figure_ct_source_random) 
+                      + F.l1_loss(figure_ct_reproj_random_random, figure_ct_source_random) \
+                    #   + F.l1_loss(figure_xr_reproj_hidden_hidden, figure_xr_source_hidden) \
         
-        # pc3d_loss_all = self.p30loss(volume_ct_reproj_hidden[:,[0],...], image3d) \
-        #               + self.p30loss(volume_ct_reproj_random[:,[0],...], image3d) \
-        #               + self.p25loss(volume_ct_reproj_hidden[:,[0],...], image3d) \
-        #               + self.p25loss(volume_ct_reproj_random[:,[0],...], image3d) \
+        pc3d_loss_all = self.p30loss(volume_ct_reproj_hidden[:,[0],...], image3d) \
+                      + self.p30loss(volume_ct_reproj_random[:,[0],...], image3d) \
+                      + self.p25loss(volume_ct_reproj_hidden[:,[0],...], image3d) \
+                      + self.p25loss(volume_ct_reproj_random[:,[0],...], image3d) \
+                      + self.p30loss(volume_xr_reproj_hidden[:,[0],...], image3d) \
+                      + self.p25loss(volume_xr_reproj_hidden[:,[0],...], image3d) \
 
-        # pc3d_loss_all = torch.nan_to_num(pc3d_loss_all, nan=1.0) 
+        pc3d_loss_all = torch.nan_to_num(pc3d_loss_all, nan=1.0) 
 
-        # pc2d_loss_all = self.p20loss(figure_ct_reproj_hidden_hidden, figure_ct_source_hidden) \
-        #               + self.p20loss(figure_ct_reproj_hidden_random, figure_ct_source_random) \
-        #               + self.p20loss(figure_ct_reproj_random_hidden, figure_ct_source_hidden) \
-        #               + self.p20loss(figure_ct_reproj_random_random, figure_ct_source_random) \
+        pc2d_loss_all = self.p20loss(figure_ct_reproj_hidden_hidden, figure_ct_source_hidden) \
+                      + self.p20loss(figure_ct_reproj_hidden_random, figure_ct_source_random) \
+                      + self.p20loss(figure_ct_reproj_random_hidden, figure_ct_source_hidden) \
+                      + self.p20loss(figure_ct_reproj_random_random, figure_ct_source_random) \
+                      + self.p20loss(figure_xr_reproj_hidden_random, figure_ct_source_random) \
+                      + self.p20loss(figure_ct_reproj_hidden_hidden, image2d) \
+                      + self.p20loss(figure_ct_reproj_random_hidden, image2d) \
+                      + self.p20loss(figure_xr_reproj_hidden_hidden, image2d) \
+                    #   + self.p20loss(figure_ct_source_hidden, image2d) \
                       
-        # pc2d_loss_all = torch.nan_to_num(pc2d_loss_all, nan=1.0) 
+        pc2d_loss_all = torch.nan_to_num(pc2d_loss_all, nan=1.0) 
         
-        loss = self.train_cfg.alpha * im2d_loss_inv + self.train_cfg.gamma * im3d_loss_inv  
+        loss = self.train_cfg.alpha * im2d_loss_inv + self.train_cfg.gamma * im3d_loss_inv \
+             + self.train_cfg.lamda * pc2d_loss_all + self.train_cfg.lamda * pc3d_loss_all  
         
         self.log(f"{stage}_loss", loss, on_step=(stage == "train"), prog_bar=True, logger=True, sync_dist=True, batch_size=B)
         loss = torch.nan_to_num(loss, nan=1.0) 
-        
         # Visualization step
         if batch_idx == 0:
             # Sampling step for X-ray
