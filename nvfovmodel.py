@@ -161,7 +161,7 @@ class FoVLightningModule(LightningModule):
             num_res_blocks=2,
             upcast_attention=True,
             use_flash_attention=True,
-            # dropout_cattn=0.5
+            dropout_cattn=0.5
             # with_conditioning=True, 
             # cross_attention_dim=12, # Condition with straight/hidden view  # flatR | flatT
         )
@@ -236,15 +236,15 @@ class FoVLightningModule(LightningModule):
         self.unet3d_model = UNet(
             spatial_dims=3,
             in_channels=1,
-            out_channels=1, 
+            out_channels=3, 
             channels=(64, 128, 256, 512, 1024), #encoder_feature_channel["efficientnet-b8"], 
             strides=(2, 2, 2, 2), #(2, 2, 2, 2, 2),
             num_res_units=2,
             kernel_size=3,
             up_kernel_size=3,
             act=("LeakyReLU", {"inplace": True}),
-            # dropout=0.5,
-            # norm=Norm.BATCH,
+            dropout=0.5,
+            norm=Norm.BATCH,
             # mode="pixelshuffle",
         )
 
@@ -421,6 +421,10 @@ class FoVLightningModule(LightningModule):
 
         if self.unet3d_model is not None:
             out = self.unet3d_model(res)
+            if out.shape[1]==3:
+                out = torch.permute(out[:,[0]], [0, 1, 2, 3, 4]) \
+                    + torch.permute(out[:,[0]], [0, 1, 3, 4, 2]) \
+                    + torch.permute(out[:,[0]], [0, 1, 4, 2, 3])
             # out = self.unet3d_model(res, timesteps=timesteps)
             if is_training:
                 prob = torch.rand(1).item()
@@ -461,8 +465,8 @@ class FoVLightningModule(LightningModule):
         figure_ct_source_random = self.forward_screen(image3d=image3d+noise_std_0, cameras=view_random, learnable_windowing=False)
             
         # Run the forward pass
-        figure_dx_source_concat = torch.cat([figure_xr_source_hidden, figure_ct_source_hidden, figure_ct_source_random])
-        camera_dx_render_concat = join_cameras_as_batch([view_hidden, view_hidden, view_random])
+        figure_dx_source_concat = torch.cat([figure_xr_source_hidden, figure_ct_source_hidden])
+        camera_dx_render_concat = join_cameras_as_batch([view_hidden, view_hidden])
 
         # For 3D
         volume_dx_reproj_concat = self.forward_volume(
@@ -471,8 +475,7 @@ class FoVLightningModule(LightningModule):
             is_training=(stage=='train')
         )
         volume_xr_reproj_hidden, \
-        volume_ct_reproj_hidden, \
-        volume_ct_reproj_random = torch.split(volume_dx_reproj_concat, B, dim=0)
+        volume_ct_reproj_hidden = torch.split(volume_dx_reproj_concat, B, dim=0)
            
         figure_xr_reproj_hidden_hidden = self.forward_screen(image3d=volume_xr_reproj_hidden[:,[0],...], cameras=view_hidden, learnable_windowing=False)
         figure_xr_reproj_hidden_random = self.forward_screen(image3d=volume_xr_reproj_hidden[:,[0],...], cameras=view_random, learnable_windowing=False)
@@ -480,30 +483,11 @@ class FoVLightningModule(LightningModule):
         figure_ct_reproj_hidden_hidden = self.forward_screen(image3d=volume_ct_reproj_hidden[:,[0],...], cameras=view_hidden, learnable_windowing=False)
         figure_ct_reproj_hidden_random = self.forward_screen(image3d=volume_ct_reproj_hidden[:,[0],...], cameras=view_random, learnable_windowing=False)
         
-        figure_ct_reproj_random_hidden = self.forward_screen(image3d=volume_ct_reproj_random[:,[0],...], cameras=view_hidden, learnable_windowing=False)
-        figure_ct_reproj_random_random = self.forward_screen(image3d=volume_ct_reproj_random[:,[0],...], cameras=view_random, learnable_windowing=False)
-        
         im3d_loss_inv = F.l1_loss(volume_ct_reproj_hidden, (image3d+noise_std_1)) \
-                      + F.l1_loss(volume_ct_reproj_random, (image3d+noise_std_1)) \
-        
+                     
         im2d_loss_inv = F.l1_loss(figure_ct_reproj_hidden_hidden, figure_ct_source_hidden) \
                       + F.l1_loss(figure_ct_reproj_hidden_random, figure_ct_source_random) \
-                      + F.l1_loss(figure_ct_reproj_random_hidden, figure_ct_source_hidden) \
-                      + F.l1_loss(figure_ct_reproj_random_random, figure_ct_source_random) 
-        
-        # pc3d_loss_all = self.p30loss(volume_ct_reproj_hidden[:,[0],...], image3d) \
-        #               + self.p30loss(volume_ct_reproj_random[:,[0],...], image3d) \
-        #               + self.p25loss(volume_ct_reproj_hidden[:,[0],...], image3d) \
-        #               + self.p25loss(volume_ct_reproj_random[:,[0],...], image3d) \
-
-        # pc3d_loss_all = torch.nan_to_num(pc3d_loss_all, nan=1.0) 
-
-        # pc2d_loss_all = self.p20loss(figure_ct_reproj_hidden_hidden, figure_ct_source_hidden) \
-        #               + self.p20loss(figure_ct_reproj_hidden_random, figure_ct_source_random) \
-        #               + self.p20loss(figure_ct_reproj_random_hidden, figure_ct_source_hidden) \
-        #               + self.p20loss(figure_ct_reproj_random_random, figure_ct_source_random) \
-                      
-        # pc2d_loss_all = torch.nan_to_num(pc2d_loss_all, nan=1.0) 
+                    
         
         loss = self.train_cfg.alpha * im2d_loss_inv + self.train_cfg.gamma * im3d_loss_inv  
         
@@ -518,28 +502,27 @@ class FoVLightningModule(LightningModule):
                 
                 viz2d = torch.cat([
                     torch.cat([
-                        figure_xr_source_hidden, 
+                        image3d[:, [0], :, self.model_cfg.vol_shape // 2, :], 
                         figure_ct_source_hidden, 
                         figure_ct_source_random, 
-                        figure_xr_reproj_hidden_random,
-                        image3d[:, [0], :, self.model_cfg.vol_shape // 2, :], 
-                        image3d[:, [0], :, self.model_cfg.vol_shape // 2, :], 
-                    ], dim=-1),
-                    torch.cat([
-                        figure_xr_reproj_hidden_hidden, 
+                        volume_ct_reproj_hidden[:, [0], :, self.model_cfg.vol_shape // 2, :], 
                         figure_ct_reproj_hidden_hidden, 
                         figure_ct_reproj_hidden_random, 
+                ], dim=-1),
+                    torch.cat([
+                        zeros,
+                        figure_xr_source_hidden, 
+                        zeros,
                         volume_xr_reproj_hidden[:, [0], :, self.model_cfg.vol_shape // 2, :], 
-                        volume_ct_reproj_hidden[:, [0], :, self.model_cfg.vol_shape // 2, :], 
-                        volume_ct_reproj_random[:, [0], :, self.model_cfg.vol_shape // 2, :], 
+                        figure_xr_reproj_hidden_hidden, 
+                        figure_xr_reproj_hidden_random,
                     ], dim=-1)
                 ], dim=-2)
 
                 tensorboard = self.logger.experiment
                 grid2d = torchvision.utils.make_grid(viz2d, normalize=False, scale_each=False, nrow=1, padding=0).clamp(0, 1)
                 tensorboard.add_image(f"{stage}_df_samples", grid2d, self.current_epoch * B + batch_idx)    
-                # if self.lookup_table is not None:
-                #     tensorboard.add_histogram(f"{stage}_LUT", self.lookup_table.embedding.weight.data, self.current_epoch * B + batch_idx)    
+                
         return loss
                         
     def training_step(self, batch, batch_idx):
