@@ -6,6 +6,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 # from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+from kornia.enhance import (
+    equalize, 
+    equalize3d,
+    equalize_clahe 
+)
 
 from pytorch3d.renderer.cameras import (
     FoVPerspectiveCameras,
@@ -300,8 +305,8 @@ class FoVLightningModule(LightningModule):
         #     out_channels=1,
         # )
         
-        # init_weights(self.unet2d_model, init_type="normal", init_gain=0.02)
-        # init_weights(self.unet3d_model, init_type="normal", init_gain=0.02)
+        init_weights(self.unet2d_model, init_type="normal", init_gain=0.02)
+        init_weights(self.unet3d_model, init_type="normal", init_gain=0.02)
         
         # self.p20loss = PerceptualLoss(
         #     spatial_dims=2, 
@@ -371,11 +376,13 @@ class FoVLightningModule(LightningModule):
                 b_min=-512, 
                 b_max=3071
             )
+            # image3d = equalize3d(image3d)
         else:
             indices = (4095*image3d.clamp_(0, 1)).long().reshape(image3d.shape[0], 1, -1)
             colored = self.lookup_table(indices)
             image3d = colored.reshape(image3d.shape)
         image2d = self.fwd_renderer(image3d.float(), cameras.float()).clamp_(0, 1)
+        # image2d = equalize_clahe(image2d)
         return image2d
         # indices = (4095*image3d.clamp_(0, 1)).long().reshape(B, 1, -1)
         # colored = self.lookup_table(indices)
@@ -422,13 +429,16 @@ class FoVLightningModule(LightningModule):
         if self.unet3d_model is not None:
             out = self.unet3d_model(res)
             if out.shape[1]==3:
-                out = torch.permute(out[:,[0]], [0, 1, 2, 3, 4]) \
-                    + torch.permute(out[:,[0]], [0, 1, 3, 4, 2]) \
-                    + torch.permute(out[:,[0]], [0, 1, 4, 2, 3])
+                out = torch.cat([
+                    torch.permute(out[:,[0]], [0, 1, 2, 3, 4]), 
+                    torch.permute(out[:,[1]], [0, 1, 3, 4, 2]), 
+                    torch.permute(out[:,[2]], [0, 1, 4, 2, 3]),
+                ], dim=1).mean(dim=1, keepdim=True)
+
             # out = self.unet3d_model(res, timesteps=timesteps)
             if is_training:
                 prob = torch.rand(1).item()
-                if prob < 0.5:
+                if prob < 0.1:
                     return res
                 else:
                     return out
@@ -456,13 +466,13 @@ class FoVLightningModule(LightningModule):
         azim_hidden = torch.zeros(B, device=_device)
         view_hidden = make_cameras_dea(dist_hidden, elev_hidden, azim_hidden, fov=self.model_cfg.fov, znear=self.model_cfg.min_depth, zfar=self.model_cfg.max_depth)
 
-        noise_std_0 = torch.normal(mean=torch.zeros_like(image3d), std=0.05) if stage=='train' else torch.zeros_like(image3d)
-        noise_std_1 = torch.normal(mean=torch.zeros_like(image3d), std=0.05) if stage=='train' else torch.zeros_like(image3d)
+        # noise_std_0 = torch.normal(mean=torch.zeros_like(image3d), std=0.05) if stage=='train' else torch.zeros_like(image3d)
+        # noise_std_1 = torch.normal(mean=torch.zeros_like(image3d), std=0.05) if stage=='train' else torch.zeros_like(image3d)
 
         # Construct the samples in 2D
         figure_xr_source_hidden = image2d
-        figure_ct_source_hidden = self.forward_screen(image3d=image3d+noise_std_0, cameras=view_hidden, learnable_windowing=False)
-        figure_ct_source_random = self.forward_screen(image3d=image3d+noise_std_0, cameras=view_random, learnable_windowing=False)
+        figure_ct_source_hidden = self.forward_screen(image3d=image3d, cameras=view_hidden, learnable_windowing=False)
+        figure_ct_source_random = self.forward_screen(image3d=image3d, cameras=view_random, learnable_windowing=False)
             
         # Run the forward pass
         figure_dx_source_concat = torch.cat([figure_xr_source_hidden, figure_ct_source_hidden])
@@ -483,7 +493,7 @@ class FoVLightningModule(LightningModule):
         figure_ct_reproj_hidden_hidden = self.forward_screen(image3d=volume_ct_reproj_hidden[:,[0],...], cameras=view_hidden, learnable_windowing=False)
         figure_ct_reproj_hidden_random = self.forward_screen(image3d=volume_ct_reproj_hidden[:,[0],...], cameras=view_random, learnable_windowing=False)
         
-        im3d_loss_inv = F.l1_loss(volume_ct_reproj_hidden, (image3d+noise_std_1)) \
+        im3d_loss_inv = F.l1_loss(volume_ct_reproj_hidden, (image3d)) \
                      
         im2d_loss_inv = F.l1_loss(figure_ct_reproj_hidden_hidden, figure_ct_source_hidden) \
                       + F.l1_loss(figure_ct_reproj_hidden_random, figure_ct_source_random) \

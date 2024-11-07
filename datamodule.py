@@ -27,6 +27,8 @@ from monai.transforms import (
     TransposeDict,
     RandFlipDict,
     RandZoomDict,
+    RandShiftIntensityDict, 
+    RandStdShiftIntensityDict, 
     ZoomDict,
     RandRotateDict,
     RandGaussianNoiseDict,
@@ -208,6 +210,18 @@ class UnpairedDataModule(LightningDataModule):
                 #     mode=["bilinear"],
                 #     align_corners=True,
                 # ),
+                RandShiftIntensityDict(
+                    keys=["image3d"],
+                    prob=1.0,
+                    offsets=0.1,
+                    safe=True, 
+                ),
+                RandStdShiftIntensityDict(
+                    keys=["image3d"],
+                    prob=1.0,
+                    factors=0.1,
+                    nonzero=True, 
+                ),
                 RandZoomDict(
                     keys=["image3d"],
                     prob=1.0,
@@ -217,6 +231,7 @@ class UnpairedDataModule(LightningDataModule):
                     mode=["trilinear"],
                     align_corners=True,
                 ),
+                
                 # RandGaussianNoiseDict(
                 #     keys=["image3d"],
                 #     prob=1.0, 
