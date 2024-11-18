@@ -213,13 +213,13 @@ class UnpairedDataModule(LightningDataModule):
                 RandShiftIntensityDict(
                     keys=["image3d"],
                     prob=1.0,
-                    offsets=0.1,
+                    offsets=0.02,
                     safe=True, 
                 ),
                 RandStdShiftIntensityDict(
                     keys=["image3d"],
                     prob=1.0,
-                    factors=0.1,
+                    factors=0.05,
                     nonzero=True, 
                 ),
                 RandZoomDict(

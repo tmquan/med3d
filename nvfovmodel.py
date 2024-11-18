@@ -5,12 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
-# from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-from kornia.enhance import (
-    equalize, 
-    equalize3d,
-    equalize_clahe 
-)
+import diffusers
 
 from pytorch3d.renderer.cameras import (
     FoVPerspectiveCameras,
@@ -19,30 +14,10 @@ from pytorch3d.renderer.cameras import (
 )
 from pytorch3d.renderer.camera_utils import join_cameras_as_batch
 
-
-from monai.losses import PerceptualLoss
-from monai.networks.nets import UNet, VNet, UNETR, SwinUNETR, BasicUNet, ViTAutoEnc, AttentionUnet
-from monai.networks.layers.factories import Norm
 from monai.utils import optional_import
+from monai.networks.nets import DiffusionModelUNet
 from monai.metrics import PSNRMetric, SSIMMetric
 tqdm, has_tqdm = optional_import("tqdm", name="tqdm")
-
-encoder_feature_channel = {
-    "efficientnet-b0": (16, 24, 40, 112, 320),
-    "efficientnet-b1": (16, 24, 40, 112, 320),
-    "efficientnet-b2": (16, 24, 48, 120, 352),
-    "efficientnet-b3": (24, 32, 48, 136, 384),
-    "efficientnet-b4": (24, 32, 56, 160, 448),
-    "efficientnet-b5": (24, 40, 64, 176, 512),
-    "efficientnet-b6": (32, 40, 72, 200, 576),
-    "efficientnet-b7": (32, 48, 80, 224, 640),
-    "efficientnet-b8": (32, 56, 88, 248, 704),
-    "efficientnet-l2": (72, 104, 176, 480, 1376),
-}
-
-from generative.inferers import DiffusionInferer
-from generative.networks.nets import DiffusionModelUNet
-from generative.networks.schedulers import DDPMScheduler, DDIMScheduler
 
 from typing import Any, Callable, Dict, Optional, OrderedDict, Tuple, List
 from lightning.pytorch import LightningModule
@@ -66,70 +41,6 @@ def make_cameras_dea(
         return FoVOrthographicCameras(R=R, T=T, znear=znear, zfar=zfar).to(_device)
     return FoVPerspectiveCameras(R=R, T=T, fov=fov, znear=znear, zfar=zfar).to(_device)
 
-
-
-def init_weights(net, init_type='normal', init_gain=0.02):
-    """Initialize network weights.
-    Parameters:
-        net (network)   -- network to be initialized
-        init_type (str) -- the name of an initialization method: normal | xavier | kaiming | orthogonal
-        init_gain (float)    -- scaling factor for normal, xavier and orthogonal.
-    We use 'normal' in the original pix2pix and CycleGAN paper. But xavier and kaiming might
-    work better for some applications. Feel free to try yourself.
-    """
-    def init_func(m):  # define the initialization function
-        classname = m.__class__.__name__
-        if hasattr(m, 'weight') and (classname.find('Conv') != -1 or classname.find('Linear') != -1):
-            if init_type == 'normal':
-                nn.init.normal_(m.weight.data, 0.0, init_gain)
-            elif init_type == 'xavier':
-                nn.init.xavier_normal_(m.weight.data, gain=init_gain)
-            elif init_type == 'kaiming':
-                nn.init.kaiming_normal_(m.weight.data, a=0, mode='fan_in')
-            elif init_type == 'orthogonal':
-                nn.init.orthogonal_(m.weight.data, gain=init_gain)
-            else:
-                raise NotImplementedError('initialization method [%s] is not implemented' % init_type)
-            if hasattr(m, 'bias') and m.bias is not None:
-                nn.init.constant_(m.bias.data, 0.0)
-        elif classname.find('BatchNorm') != -1:  # BatchNorm Layer's weight is not a matrix; only normal distribution applies.
-            nn.init.normal_(m.weight.data, 1.0, init_gain)
-            nn.init.constant_(m.bias.data, 0.0)
-    # print('initialize network with %s' % init_type)
-    net.apply(init_func)  # apply the initialization function <init_func>
-
-
-class CustomEmbedding(nn.Module):
-    def __init__(self, num_embeddings=4096, embedding_dim=1, v_min=100, v_max=3000):
-        super(CustomEmbedding, self).__init__()
-        
-        # Ensure that 0 < v_min < v_max < num_embeddings
-        assert 0 < v_min < v_max < num_embeddings, "Values must satisfy 0 < v_min < v_max < num_embeddings"
-        self.num_embeddings = num_embeddings
-        self.embedding_dim = embedding_dim
-
-        self.embedding = nn.Embedding(
-            num_embeddings=self.num_embeddings, 
-            embedding_dim=self.embedding_dim)
-        
-        # Initialize the weights using linear spacing
-        self.initialize_weights(v_min, v_max)
-
-    def initialize_weights(self, v_min, v_max):
-        # Ensure that v_min and v_max are within valid bounds
-        assert 0 <= v_min < v_max <= self.num_embeddings, "Invalid range for weight initialization."
-        
-        # Create a linearly spaced tensor from 0 to 1 with appropriate steps
-        steps = v_max - v_min + 1  # Include both endpoints
-        weights = torch.linspace(0, 1, steps=steps)
-        
-        # Assign the initialized weights to the appropriate indices in the lookup table
-        self.embedding.weight.data[v_min:v_max + 1] = weights.unsqueeze(1)  # Include v_max
-        self.embedding.weight.data[:v_min] = 0.0  # Set weights before v_min to 0.0
-        self.embedding.weight.data[v_max + 1:] = 1.0  # Set weights after v_max to 1.0
-
-    def forward(self, indices):
-        return self.embedding(indices)
     
 class FoVLightningModule(LightningModule):
     def __init__(self, model_cfg: DictConfig, train_cfg: DictConfig):
@@ -138,15 +49,6 @@ class FoVLightningModule(LightningModule):
         self.model_cfg = model_cfg
         self.train_cfg = train_cfg
         
-        # self.lookup_table = nn.Embedding(
-        #     num_embeddings=4096, 
-        #     embedding_dim=1
-        # )
-        
-        # self.lookup_table.weight.data = torch.linspace(0, 1, steps=4096).unsqueeze(1) 
-        # self.lookup_table.weight.data.uniform_(0, 1) #.long()
-        # self.lookup_table.weight.data.zero_().long()
-        # self.lookup_table = CustomEmbedding(v_min=-512+1024, v_max=3071+1024)
         self.fwd_renderer = ObjectCentricXRayVolumeRenderer(
             image_width=model_cfg.img_shape,
             image_height=model_cfg.img_shape,
@@ -156,179 +58,69 @@ class FoVLightningModule(LightningModule):
             ndc_extent=model_cfg.ndc_extent,
         )
 
-        self.unet2d_model = DiffusionModelUNet(
-            spatial_dims=2,
-            in_channels=1,
-            out_channels=model_cfg.fov_depth,
-            num_channels=[256, 256, 512],
-            attention_levels=[False, False, True],
-            num_head_channels=[0, 0, 512],
-            num_res_blocks=2,
-            upcast_attention=True,
-            use_flash_attention=True,
-            dropout_cattn=0.5
-            # with_conditioning=True, 
-            # cross_attention_dim=12, # Condition with straight/hidden view  # flatR | flatT
+        self.unet2d_model = diffusers.models.UNet2DConditionModel(
+            sample_size=model_cfg.img_shape, 
+            in_channels=1, 
+            out_channels=model_cfg.fov_depth, 
+            layers_per_block=2, # how many ResNet layers to use per UNet block
+            block_out_channels=(256, 256, 512, 512), # the number of output channels for eaxh UNet block
+            down_block_types=(
+                "DownBlock2D",
+                "DownBlock2D",
+                "CrossAttnDownBlock2D",
+                "CrossAttnDownBlock2D",
+            ),
+            up_block_types=(
+                "CrossAttnUpBlock2D", 
+                "CrossAttnUpBlock2D", 
+                "UpBlock2D",
+                "UpBlock2D"
+            ),
+            dropout=0.5,
+            cross_attention_dim=12
         )
 
-        # self.unet2d_model = UNet(
-        #     spatial_dims=2,
-        #     in_channels=1,
-        #     out_channels=model_cfg.fov_depth, 
-        #     channels=(64, 128, 256, 512, 1024), #encoder_feature_channel["efficientnet-b8"], 
-        #     strides=(2, 2, 2, 2), #(2, 2, 2, 2, 2),
-        #     num_res_units=2,
-        #     kernel_size=3,
-        #     up_kernel_size=3,
-        #     act=("LeakyReLU", {"inplace": True}),
-        #     dropout=0.5,
-        #     # norm=Norm.BATCH,
-        #     # mode="pixelshuffle",
-        # )
-
-        # self.unet3d_model = DiffusionModelUNet(
-        #     spatial_dims=3,
-        #     in_channels=1,
-        #     out_channels=1,
-        #     num_channels=[64, 64, 128],
-        #     attention_levels=[False, False, True],
-        #     num_head_channels=[0, 0, 128],
-        #     num_res_blocks=2,
-        #     # upcast_attention=True,
-        #     # use_flash_attention=True,
-        #     # dropout_cattn=0.5
-        #     # with_conditioning=True, 
-        #     # cross_attention_dim=12, # Condition with straight/hidden view  # flatR | flatT
-        # )
-
-        # self.unet2d_model = UNet(
-        #     spatial_dims=2,
-        #     in_channels=1,
-        #     out_channels=model_cfg.fov_depth,
-        #     channels=encoder_feature_channel["efficientnet-b8"],
-        #     strides=(2, 2, 2, 2),
-        #     num_res_units=4,
-        #     kernel_size=3,
-        #     up_kernel_size=3,
-        #     # act=("LeakyReLU", {"inplace": True}),
-        #     # dropout=0.5,
-        #     # norm=Norm.BATCH,
-        # )
-
-        # self.unet3d_model = BasicUNet(
-        #     spatial_dims=3, 
-        #     in_channels=1, 
-        #     out_channels=2, 
-        #     features=(32, 32, 64, 128, 256, 32), 
-        #     act=('LeakyReLU', {'inplace': True, 'negative_slope': 0.1}), norm=('instance', {'affine': True}), 
-        #     bias=True, 
-        #     dropout=0.0, 
-        #     upsample='pixelshuffle'
-        # )
-
-        # self.unet3d_model = AttentionUnet(
-        #     spatial_dims=3, 
+        self.unet3d_model = None 
+        # self.unet3d_model = diffusers.models.AutoencoderKLCogVideoX(
+        #     sample_height=model_cfg.img_shape, 
+        #     sample_width=model_cfg.img_shape, 
         #     in_channels=1, 
         #     out_channels=1, 
-        #     channels=encoder_feature_channel["efficientnet-b5"], 
-        #     strides=(2, 2, 2, 2), 
-        #     kernel_size=3, 
-        #     up_kernel_size=3, 
-        #     # dropout=0.5
+        #     layers_per_block=2, # how many ResNet layers to use per UNet block
+        #     block_out_channels=(128, 256), # the number of output channels for eaxh UNet block
+        #     down_block_types=(
+        #         "CogVideoXDownBlock3D",
+        #         "CogVideoXDownBlock3D",
+        #         # "CogVideoXDownBlock3D",
+        #         # "CogVideoXDownBlock3D"
+        #     ),
+        #     up_block_types=(
+        #         # "CogVideoXUpBlock3D",
+        #         # "CogVideoXUpBlock3D",
+        #         "CogVideoXUpBlock3D",
+        #         "CogVideoXUpBlock3D"
+        #     ),
         # )
 
-        # self.unet3d_model = None
-        self.unet3d_model = UNet(
-            spatial_dims=3,
-            in_channels=1,
-            out_channels=3, 
-            channels=(64, 128, 256, 512, 1024), #encoder_feature_channel["efficientnet-b8"], 
-            strides=(2, 2, 2, 2), #(2, 2, 2, 2, 2),
-            num_res_units=2,
-            kernel_size=3,
-            up_kernel_size=3,
-            act=("LeakyReLU", {"inplace": True}),
-            dropout=0.5,
-            norm=Norm.BATCH,
-            # mode="pixelshuffle",
-        )
-
-        # self.unet3d_model = ViTAutoEnc(
+        # self.unet3d_model = diffusers.models.UNet3DConditionModel(
+        #     sample_size=model_cfg.img_shape, 
         #     in_channels=1, 
-        #     patch_size=16,
-        #     img_size=model_cfg.vol_shape,
-        #     proj_type='conv', 
-        #     deconv_chns=16, 
-        #     num_layers=8,
-        #     num_heads=8,
-        # )
-
-        # self.unet3d_model = SwinUNETR(
-        #     spatial_dims=3,
-        #     in_channels=1,
-        #     out_channels=1, # value and alpha
-        #     img_size=model_cfg.vol_shape, 
-        #     feature_size=12,
-        #     depths=(2, 2, 2, 2), 
-        #     num_heads=(3, 6, 12, 24), 
-        #     norm_name='instance', 
-        #     drop_rate=0.0, 
-        #     attn_drop_rate=0.0, 
-        #     dropout_path_rate=0.0, 
-        #     normalize=False, 
-        #     use_checkpoint=False, 
-        #     downsample='mergingv2', 
-        #     use_v2=False
-        # )
-
-        # self.unet3d_model = UNETR(
-        #     spatial_dims=3,
-        #     in_channels=1,
-        #     out_channels=1, # value and alpha
-        #     img_size=model_cfg.vol_shape, 
-        #     feature_size=16, 
-        #     hidden_size=512, #768, 
-        #     mlp_dim=512, #3072, 
-        #     num_heads=4, #12, 
-        #     proj_type='conv', 
-        #     norm_name='instance', 
-        #     conv_block=True, 
-        #     res_block=True, 
-        #     dropout_rate=0.0, 
-        #     qkv_bias=False, 
-        #     save_attn=False
-        # )
-
-        # self.unet3d_model = VNet(
-        #     spatial_dims=3, 
-        #     in_channels=1,
-        #     out_channels=1,
-        # )
-        
-        init_weights(self.unet2d_model, init_type="normal", init_gain=0.02)
-        init_weights(self.unet3d_model, init_type="normal", init_gain=0.02)
-        
-        # self.p20loss = PerceptualLoss(
-        #     spatial_dims=2, 
-        #     network_type="radimagenet_resnet50", 
-        #     is_fake_3d=False, 
-        #     pretrained=True,
+        #     out_channels=1, 
+        #     layers_per_block=2, # how many ResNet layers to use per UNet block
+        #     block_out_channels=(128, 128, 256), # the number of output channels for eaxh UNet block
+        #     down_block_types=(
+        #         "DownBlock3D",
+        #         "DownBlock3D",
+        #         "DownBlock3D",
+        #     ),
+        #     up_block_types=(
+        #         "UpBlock3D", 
+        #         "UpBlock3D", 
+        #         "UpBlock3D"
+        #     ),
+        #     # cross_attention_dim=0
         # ) 
         
-        # self.p25loss = PerceptualLoss(
-        #     spatial_dims=3, 
-        #     network_type="radimagenet_resnet50", 
-        #     is_fake_3d=True, fake_3d_ratio=16/256.,
-        #     pretrained=True,
-        # ) 
-
-        # self.p30loss = PerceptualLoss(
-        #     spatial_dims=3, 
-        #     network_type="medicalnet_resnet50_23datasets", 
-        #     is_fake_3d=False, 
-        #     pretrained=True,
-        # ) 
-
         if model_cfg.phase=="finetune":
             pass
         
@@ -367,7 +159,7 @@ class FoVLightningModule(LightningModule):
         T_new = (T_raw - b_min) / range_new 
         return T_new.clamp(0, 1)
     
-    def forward_screen(self, image3d, cameras, learnable_windowing=True):
+    def forward_screen(self, image3d, cameras, learnable_windowing=False):
         if learnable_windowing==False:
             image3d = self.correct_window(
                 image3d, 
@@ -384,11 +176,6 @@ class FoVLightningModule(LightningModule):
         image2d = self.fwd_renderer(image3d.float(), cameras.float()).clamp_(0, 1)
         # image2d = equalize_clahe(image2d)
         return image2d
-        # indices = (4095*image3d.clamp_(0, 1)).long().reshape(B, 1, -1)
-        # colored = self.lookup_table(indices)
-        # reshape = colored.reshape(image3d.shape)
-        # image2d = self.fwd_renderer(reshape, cameras).clamp_(0, 1)
-        # return image2d
     
     def flatten_cameras(self, cameras, zero_translation=False):
         camera_ = cameras.clone()
@@ -405,7 +192,8 @@ class FoVLightningModule(LightningModule):
         _device = image2d.device
         B = image2d.shape[0]
         timesteps = 0*torch.randint(0, 1000, (B,), device=_device).long()  
-        out = self.unet2d_model.forward(image2d, timesteps=timesteps)
+        cam_feats = self.flatten_cameras(cameras)
+        out = self.unet2d_model.forward(image2d, timesteps, cam_feats).sample
 
         # Resample the frustum out
         z = torch.linspace(-1.0, 1.0, steps=self.model_cfg.vol_shape, device=_device)
@@ -427,7 +215,12 @@ class FoVLightningModule(LightningModule):
         res = torch.flip(res, dims=(-2,))
 
         if self.unet3d_model is not None:
-            out = self.unet3d_model(res)
+            # dist_hidden = 8 * torch.ones(B, device=_device)
+            # elev_hidden = torch.zeros(B, device=_device)
+            # azim_hidden = torch.zeros(B, device=_device)
+            # view_hidden = make_cameras_dea(dist_hidden, elev_hidden, azim_hidden, fov=self.model_cfg.fov, znear=self.model_cfg.min_depth, zfar=self.model_cfg.max_depth)
+            # out = self.unet3d_model(res, timesteps, self.flatten_cameras(view_hidden)).sample
+            out = self.unet3d_model(res).sample
             if out.shape[1]==3:
                 out = torch.cat([
                     torch.permute(out[:,[0]], [0, 1, 2, 3, 4]), 
@@ -457,7 +250,7 @@ class FoVLightningModule(LightningModule):
 
         # Construct the random cameras, -1 and 1 are the same point in azimuths
         dist_random = 8 * torch.ones(B, device=_device)
-        elev_random = torch.zeros_like(dist_random, device=_device)
+        elev_random = torch.zeros(B, device=_device)
         azim_random = torch.rand_like(dist_random) * 2 - 1  # from [0 1) to [-1 1)
         view_random = make_cameras_dea(dist_random, elev_random, azim_random, fov=self.model_cfg.fov, znear=self.model_cfg.min_depth, zfar=self.model_cfg.max_depth)
     
@@ -466,39 +259,41 @@ class FoVLightningModule(LightningModule):
         azim_hidden = torch.zeros(B, device=_device)
         view_hidden = make_cameras_dea(dist_hidden, elev_hidden, azim_hidden, fov=self.model_cfg.fov, znear=self.model_cfg.min_depth, zfar=self.model_cfg.max_depth)
 
-        # noise_std_0 = torch.normal(mean=torch.zeros_like(image3d), std=0.05) if stage=='train' else torch.zeros_like(image3d)
-        # noise_std_1 = torch.normal(mean=torch.zeros_like(image3d), std=0.05) if stage=='train' else torch.zeros_like(image3d)
-
         # Construct the samples in 2D
         figure_xr_source_hidden = image2d
-        figure_ct_source_hidden = self.forward_screen(image3d=image3d, cameras=view_hidden, learnable_windowing=False)
-        figure_ct_source_random = self.forward_screen(image3d=image3d, cameras=view_random, learnable_windowing=False)
+        figure_ct_source_hidden = self.forward_screen(image3d=image3d, cameras=view_hidden)
+        figure_ct_source_random = self.forward_screen(image3d=image3d, cameras=view_random)
             
         # Run the forward pass
-        figure_dx_source_concat = torch.cat([figure_xr_source_hidden, figure_ct_source_hidden])
-        camera_dx_render_concat = join_cameras_as_batch([view_hidden, view_hidden])
+        figure_dx_source_concat = torch.cat([figure_xr_source_hidden, figure_ct_source_hidden, figure_ct_source_random])
+        camera_dx_render_concat = join_cameras_as_batch([view_hidden, view_hidden, view_random])
 
         # For 3D
         volume_dx_reproj_concat = self.forward_volume(
             image2d=figure_dx_source_concat, 
             cameras=camera_dx_render_concat, 
-            is_training=(stage=='train')
         )
         volume_xr_reproj_hidden, \
-        volume_ct_reproj_hidden = torch.split(volume_dx_reproj_concat, B, dim=0)
+        volume_ct_reproj_hidden, \
+        volume_ct_reproj_random = torch.split(volume_dx_reproj_concat, B, dim=0)
            
-        figure_xr_reproj_hidden_hidden = self.forward_screen(image3d=volume_xr_reproj_hidden[:,[0],...], cameras=view_hidden, learnable_windowing=False)
-        figure_xr_reproj_hidden_random = self.forward_screen(image3d=volume_xr_reproj_hidden[:,[0],...], cameras=view_random, learnable_windowing=False)
+        figure_xr_reproj_hidden_hidden = self.forward_screen(image3d=volume_xr_reproj_hidden[:,[0],...], cameras=view_hidden)
+        figure_xr_reproj_hidden_random = self.forward_screen(image3d=volume_xr_reproj_hidden[:,[0],...], cameras=view_random)
         
-        figure_ct_reproj_hidden_hidden = self.forward_screen(image3d=volume_ct_reproj_hidden[:,[0],...], cameras=view_hidden, learnable_windowing=False)
-        figure_ct_reproj_hidden_random = self.forward_screen(image3d=volume_ct_reproj_hidden[:,[0],...], cameras=view_random, learnable_windowing=False)
+        figure_ct_reproj_hidden_hidden = self.forward_screen(image3d=volume_ct_reproj_hidden[:,[0],...], cameras=view_hidden)
+        figure_ct_reproj_hidden_random = self.forward_screen(image3d=volume_ct_reproj_hidden[:,[0],...], cameras=view_random)
         
-        im3d_loss_inv = F.l1_loss(volume_ct_reproj_hidden, (image3d)) \
-                     
-        im2d_loss_inv = F.l1_loss(figure_ct_reproj_hidden_hidden, figure_ct_source_hidden) \
-                      + F.l1_loss(figure_ct_reproj_hidden_random, figure_ct_source_random) \
-                    
+        figure_ct_reproj_random_hidden = self.forward_screen(image3d=volume_ct_reproj_random[:,[0],...], cameras=view_hidden)
+        figure_ct_reproj_random_random = self.forward_screen(image3d=volume_ct_reproj_random[:,[0],...], cameras=view_random)
         
+        im3d_loss_inv = F.l1_loss(volume_ct_reproj_hidden, image3d) \
+                      + F.l1_loss(volume_ct_reproj_random, image3d)             
+        
+        im2d_loss_inv = F.l1_loss(figure_ct_reproj_hidden_hidden, figure_ct_source_hidden) * 1 \
+                      + F.l1_loss(figure_ct_reproj_hidden_random, figure_ct_source_random) * 2 \
+                      + F.l1_loss(figure_ct_reproj_random_hidden, figure_ct_source_hidden) * 2 \
+                      + F.l1_loss(figure_ct_reproj_random_random, figure_ct_source_random) * 1 \
+                      
         loss = self.train_cfg.alpha * im2d_loss_inv + self.train_cfg.gamma * im3d_loss_inv  
         
         self.log(f"{stage}_loss", loss, on_step=(stage == "train"), prog_bar=True, logger=True, sync_dist=True, batch_size=B)
@@ -518,7 +313,15 @@ class FoVLightningModule(LightningModule):
                         volume_ct_reproj_hidden[:, [0], :, self.model_cfg.vol_shape // 2, :], 
                         figure_ct_reproj_hidden_hidden, 
                         figure_ct_reproj_hidden_random, 
-                ], dim=-1),
+                    ], dim=-1),
+                    torch.cat([
+                        image3d[:, [0], :, self.model_cfg.vol_shape // 2, :], 
+                        figure_ct_source_hidden, 
+                        figure_ct_source_random, 
+                        volume_ct_reproj_random[:, [0], :, self.model_cfg.vol_shape // 2, :], 
+                        figure_ct_reproj_random_hidden, 
+                        figure_ct_reproj_random_random, 
+                    ], dim=-1),
                     torch.cat([
                         zeros,
                         figure_xr_source_hidden, 
