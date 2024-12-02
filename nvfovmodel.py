@@ -259,8 +259,8 @@ class FoVLightningModule(LightningModule):
 
         # Construct the random cameras, -1 and 1 are the same point in azimuths
         dist_random = 8 * torch.ones(B, device=_device)
-        # elev_random = torch.zeros(B, device=_device)
-        elev_random = torch.rand_like(dist_random) - 0.5
+        elev_random = torch.zeros(B, device=_device)
+        # elev_random = torch.rand_like(dist_random) - 0.5
         azim_random = torch.rand_like(dist_random) * 2 - 1  # from [0 1) to [-1 1)
         view_random = make_cameras_dea(dist_random, elev_random, azim_random, fov=self.model_cfg.fov, znear=self.model_cfg.min_depth, zfar=self.model_cfg.max_depth)
     
@@ -296,15 +296,15 @@ class FoVLightningModule(LightningModule):
         figure_ct_reproj_random_hidden = self.forward_screen(image3d=volume_ct_reproj_random[:,[0],...], cameras=view_hidden)
         figure_ct_reproj_random_random = self.forward_screen(image3d=volume_ct_reproj_random[:,[0],...], cameras=view_random)
         
-        im3d_loss_inv = F.l1_loss(volume_ct_reproj_hidden, image3d) * 1 \
-                      + F.l1_loss(volume_ct_reproj_random, image3d) * self.train_cfg.alpha            
-        
-        im2d_loss_inv = F.l1_loss(figure_ct_reproj_hidden_hidden, figure_ct_source_hidden) * 1 \
-                      + F.l1_loss(figure_ct_reproj_hidden_random, figure_ct_source_random) * self.train_cfg.alpha \
-                      + F.l1_loss(figure_ct_reproj_random_hidden, figure_ct_source_hidden) * self.train_cfg.alpha \
-                      + F.l1_loss(figure_ct_reproj_random_random, figure_ct_source_random) * 1 \
+        im3d_loss_inv = F.l1_loss(volume_ct_reproj_hidden, image3d) * self.train_cfg.alpha\
+                      + F.l1_loss(volume_ct_reproj_random, image3d) * self.train_cfg.gamma \
+
+        im2d_loss_inv = F.l1_loss(figure_ct_reproj_hidden_hidden, figure_ct_source_hidden) * self.train_cfg.alpha\
+                      + F.l1_loss(figure_ct_reproj_hidden_random, figure_ct_source_random) * self.train_cfg.gamma\
+                      + F.l1_loss(figure_ct_reproj_random_hidden, figure_ct_source_hidden) * self.train_cfg.gamma\
+                      + F.l1_loss(figure_ct_reproj_random_random, figure_ct_source_random) * self.train_cfg.alpha\
                       
-        loss = self.train_cfg.alpha * im2d_loss_inv + self.train_cfg.gamma * im3d_loss_inv  
+        loss = im2d_loss_inv + im3d_loss_inv  
         
         if self.perc25d_loss is not None:
             perc25d_loss = self.perc25d_loss(volume_ct_reproj_hidden, image3d) \
